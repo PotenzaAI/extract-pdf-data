@@ -90,7 +90,7 @@ python .\pdf_to_md_docling_supabase.py `
   --wm-clean `                               # Remove marcas d'água
   --drop-repeated `                          # Remove imagens repetidas (cab/rodapé)
   --drop-image-template "logo.png" `         # Template da logo (CAB) para remoção
-  --emit-file                                # Também gera o arquivo .md local
+  --emit-file --force-bom                    # Também gera o arquivo .md local e padrão utf-8
 ```
 
 ```bash
@@ -106,7 +106,7 @@ python ./pdf_to_md_docling_supabase.py \
   --wm-clean \
   --drop-repeated \
   --drop-image-template "logo.png" \
-  --emit-file
+  --emit-file --force-bom                   
 ```
 
 ### Modo URL única
@@ -121,7 +121,7 @@ python .\pdf_to_md_docling_supabase.py `
   --wm-clean `
   --drop-repeated `
   --drop-image-template "logo.png" `
-  --emit-file
+  --emit-file --force-bom                   
 ```
 
 ```bash
@@ -132,7 +132,7 @@ python ./pdf_to_md_docling_supabase.py \
   --wm-clean \
   --drop-repeated \
   --drop-image-template "logo.png" \
-  --emit-file
+  --emit-file --force-bom                    
 ```
 
 ---
