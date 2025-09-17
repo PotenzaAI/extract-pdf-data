@@ -9,17 +9,18 @@ Pode operar lendo **registros de URL/ID** de uma **tabela no Supabase** e, ao fi
 ### Leitura do PDF
 
 Utiliza `pdf_to_md_docling_supabase.py` para converter o PDF em Markdown e extrair as imagens.
+Cria um arquivo em markdown com o conteúdo da extração chamado `_docling.md`.
 
 ### Higienização de imagens
 
 * Remove **marcas d’água** (via `--wm-clean`, utilizando `remove.py` por baixo dos panos).
 * Remove **logos** conhecidas com base em um **template** (`--drop-image-template "logo.png"`) e **hash perceptual**.
 * Deduplica **imagens repetidas** (ex.: cabeçalho/rodapé) com `--drop-repeated`.
-
+* 
 ### Upload para Supabase Storage
 
 * Envia as **imagens** para o **bucket** configurado.
-* Reescreve o **Markdown** substituindo os caminhos locais pelas **URLs públicas** do Supabase.
+* Reescreve o **Markdown** substituindo os caminhos locais pelas **URLs públicas** do Supabase em um novo arquivo markdown nomeado de acordo com o id `id.pdf` .
 
 ### Persistência
 
