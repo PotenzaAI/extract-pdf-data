@@ -82,7 +82,7 @@ Processa registros lendo **ID** e **URL do PDF** de uma tabela no Supabase e env
 # PowerShell (Windows)
 python .\pdf_to_md_docling_supabase.py `
   --db-table transmission_manuals `          # Nome da tabela
-  --db-id-col id `                           # Nome da coluna com o ID
+  --db-id-col transmission_guide_id `                           # Nome da coluna com o ID
   --db-url-col pdf_url `                     # Nome da coluna com a URL do PDF
   --db-md-to storage `                       # Envia o Markdown ao bucket
   --storage-prefix "articles/images" `       # Caminho no bucket para IMAGENS
@@ -98,7 +98,7 @@ python .\pdf_to_md_docling_supabase.py `
 # Bash (Linux/macOS) - mesma chamada em múltiplas linhas:
 python ./pdf_to_md_docling_supabase.py \
   --db-table transmission_manuals \
-  --db-id-col id \
+  --db-id-col transmission_guide_id \
   --db-url-col pdf_url \
   --db-md-to storage \
   --storage-prefix "articles/images" \
