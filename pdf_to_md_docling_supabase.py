@@ -15,7 +15,8 @@ import unicodedata
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
-
+from pathlib import Path
+from typing import Dict, List
 import numpy as np
 import requests
 from PIL import Image
@@ -1099,16 +1100,73 @@ def upload_text_to_supabase(
 
     return public_url
 
+
+
+from pathlib import Path
+from typing import Dict, List
+
+def sniff_mime(data: bytes, fallback_ext: str) -> str:
+    # 1) Tenta detectar pelos magic bytes
+    try:
+        import filetype  # pip install filetype
+        kind = filetype.guess(data)
+        if kind and kind.mime.startswith("image/"):
+            return kind.mime
+    except Exception:
+        pass
+
+    # 2) Se não deu, tenta pelo sufixo
+    ext = (fallback_ext or "").lower()
+    if ext in {".png"}:
+        return "image/png"
+    if ext in {".jpg", ".jpeg"}:
+        return "image/jpeg"
+    if ext in {".webp"}:
+        return "image/webp"
+    if ext in {".gif"}:
+        return "image/gif"
+
+    # 3) Último recurso
+    import mimetypes
+    guess = mimetypes.guess_type(f"file{ext}")[0]
+    return guess or "application/octet-stream"
+
+def supabase_storage_put(
+    project_url: str,  # ex.: https://xyzcompany.supabase.co
+    service_key: str,  # SERVICE_ROLE (ou anon key + RLS permitindo)
+    bucket: str,
+    path: str,         # uploads/abc.png
+    content: bytes,
+    content_type: str,
+    cache_control: str = "public, max-age=31536000, immutable",
+    upsert: bool = True,
+) -> None:
+    """
+    Faz PUT direto no Storage, gravando Content-Type como metadado.
+    """
+    url = f"{project_url.rstrip('/')}/storage/v1/object/{bucket}/{path.lstrip('/')}"
+    headers = {
+        "Authorization": f"Bearer {service_key}",
+        "Content-Type": content_type,                     # <- o que define o metadado
+        "x-upsert": "true" if upsert else "false",
+        "cache-control": cache_control,
+    }
+    r = requests.put(url, headers=headers, data=content, timeout=60)
+    if r.status_code not in (200, 201, 204):
+        raise RuntimeError(f"Storage PUT failed ({r.status_code}): {r.text}")
+    
 def upload_images_to_supabase(
     client,
     bucket: str,
     pdf_id: str,
     local_images: List[Path],
     storage_prefix: str = "images",
+    remote_subdir: str | None = None,
 ) -> Dict[Path, str]:
     mapping: Dict[Path, str] = {}
     storage = client.storage
 
+    # tenta importar o FileOptions do supabase-py v2
     FileOptions = None
     try:
         from supabase.storage.types import FileOptions as _FileOptions  # type: ignore
@@ -1119,48 +1177,55 @@ def upload_images_to_supabase(
     storage_prefix = (storage_prefix or "").strip().strip("/")
 
     for img_path in local_images:
-        remote_name = slug_filename(img_path.name)
-        remote_path = f"{storage_prefix}/{pdf_id}/{remote_name}" if storage_prefix else f"{pdf_id}/{remote_name}"
-
-        ext = img_path.suffix.lower()
-        if ext in {".png"}:
-            ctype = "image/png"
-        elif ext in {".jpg", ".jpeg"}:
-            ctype = "image/jpeg"
-        elif ext in {".webp"}:
-            ctype = "image/webp"
-        else:
-            ctype = "application/octet-stream"
-
         data = img_path.read_bytes()
+        ext = (img_path.suffix or ".png").lower()
+
+        # MIME real (magic bytes > extensão)
+        ctype = sniff_mime(data, ext)
+        if not ctype.startswith("image/"):
+            raise ValueError(f"{img_path.name}: não parece ser uma imagem válida (mime={ctype}).")
+
+        base = slug_filename(img_path.stem)  # sua função util
+        remote_name = f"{base}{ext}"
+        if remote_subdir:
+            remote_path = f"{storage_prefix}/{remote_subdir.strip().strip('/')}/{remote_name}"
+        else:
+            remote_path = f"{storage_prefix}/{pdf_id}/{remote_name}"
+
         uploaded = False
         last_err = None
 
-        if FileOptions is not None:
+        # Caminho preferencial: FileOptions (v2)
+        uploaded = False
+        last_err = None
+
+        # Preferencial: FileOptions (v2) — aceita bool
+        if FileOptions is not None and not uploaded:
             try:
-                opts = FileOptions(content_type=ctype, upsert=True)
+                opts = FileOptions(
+                    content_type=ctype,
+                    upsert=True,  # ok com FileOptions
+                    cache_control="public, max-age=31536000, immutable",
+                )
                 storage.from_(bucket).upload(remote_path, data, file_options=opts)
                 uploaded = True
             except Exception as e:
                 last_err = e
 
+        # Fallback: dict camelCase — upsert precisa ser string
         if not uploaded:
-            try:
-                storage.from_(bucket).upload(
-                    remote_path, data, file_options={"content_type": ctype, "upsert": "true"}
-                )
-                uploaded = True
-            except Exception as e:
-                last_err = e
-
-        if not uploaded:
-            try:
-                storage.from_(bucket).upload(
-                    remote_path, data, file_options={"contentType": ctype, "upsert": "true"}
-                )
-                uploaded = True
-            except Exception as e:
-                last_err = e
+            # 2) fallback REST PUT que **sempre** grava o Content-Type correto
+            supabase_storage_put(
+                project_url=os.environ["SUPABASE_URL"],
+                service_key=os.environ["SUPABASE_KEY"],  # ou anon
+                bucket=bucket,
+                path=remote_path,
+                content=data,
+                content_type=ctype,
+                cache_control="public, max-age=31536000, immutable",
+                upsert=True,
+            )
+            uploaded = True
 
         if not uploaded:
             raise RuntimeError(f"Falha no upload de {img_path.name}: {last_err}")
@@ -1178,7 +1243,8 @@ def upload_images_to_supabase(
 # Pipeline principal (single PDF) e modo batch (DB)
 # =========================================================
 
-def pipeline_process_pdf(pdf_id: str, pdf_url: str, args) -> tuple[str, Path]:
+def pipeline_process_pdf(pdf_id: str, pdf_url: str, args, img_remote_subdir: str | None = None) -> tuple[str, Path]:
+
     allowed_domains = [d.strip() for d in (args.allowed_domains or "").split(",") if d.strip()]
     pdf_id = slug_filename(str(pdf_id))
 
@@ -1289,7 +1355,15 @@ def pipeline_process_pdf(pdf_id: str, pdf_url: str, args) -> tuple[str, Path]:
     LOGGER.info("[5/6] Enviando imagens ao Supabase… (bucket=%s, pasta=%s/%s/)",
                 args.bucket, args.storage_prefix, pdf_id)
     client = supabase_client_from_env()
-    url_map = upload_images_to_supabase(client, args.bucket, pdf_id, local_images, storage_prefix=args.storage_prefix)
+    url_map = upload_images_to_supabase(
+        client,
+        args.bucket,
+        pdf_id,
+        local_images,
+        storage_prefix=args.storage_prefix,
+        remote_subdir=img_remote_subdir,   # <= repassa aqui
+    )
+
 
     LOGGER.info("[6/6] Reescrevendo referências de imagem no Markdown…")
     md_final = rewrite_image_paths_in_md(md_polished, base_dir=md_path.parent, url_map=url_map)
@@ -1339,14 +1413,33 @@ def run_db_batch(args) -> None:
             LOGGER.warning("[db] Linha sem colunas %s/%s. Pulando.", id_col, url_col)
             continue
 
-        if not pdf_url:
-            LOGGER.warning("[db] %s: URL vazia. Pulando.", row_id)
-            continue
+        # --- NOVO: obtenha o transmission_guide_id (nome da coluna configurável) ---
+        tg_col = args.db_guide_id_col
+        transmission_guide_id = row.get(tg_col)
+        if transmission_guide_id is None:
+            LOGGER.warning("[db] id=%s sem %s. Usando 'unknown'.", row_id, tg_col)
+            transmission_guide_id = "unknown"
 
-        LOGGER.info("[db] (%s/%s) id=%s url=%s", idx, len(rows), row_id, pdf_url)
+        # --- NOVO: monte a subpasta final a partir do template ---
         try:
-            md_final, _work_dir = pipeline_process_pdf(str(row_id), str(pdf_url), args)
+            # Ex.: "articles/images/{transmission_guide_id}/{id}" -> "articles/images/123/456"
+            subdir = args.img_path_template.format(**row)
+        except Exception:
+            # fallback seguro se faltar alguma chave
+            subdir = f"articles/images/{transmission_guide_id}/{row_id}"
 
+        LOGGER.info("[db] (%s/%s) id=%s url=%s -> img_subdir=%s", idx, len(rows), row_id, pdf_url, subdir)
+
+        try:
+            # passa a subpasta montada para o pipeline (ele repassa para o uploader)
+            md_final, _work_dir = pipeline_process_pdf(
+                str(row_id),
+                str(pdf_url),
+                args,
+                img_remote_subdir=subdir
+            )
+
+            # --- GRAVAÇÃO DO MARKDOWN NA COLUNA ---
             md_url = ""
             if args.db_md_to in ("storage", "both"):
                 remote_path = f"{args.db_md_storage_prefix.strip().strip('/')}/{slug_filename(str(row_id))}.md"
@@ -1354,12 +1447,12 @@ def run_db_batch(args) -> None:
                     client, args.bucket, remote_path, md_final,
                     content_type="text/markdown; charset=utf-8",
                     upsert=True,
-                    add_bom=args.force_bom,     # <— aqui
+                    add_bom=args.force_bom,
                 )
-
 
             if args.db_md_to in ("column", "both") and args.db_md_col:
                 try:
+                    # IMPORTANTE: garanta que o filtro .eq() bate o tipo da coluna de ID
                     client.table(table).update({args.db_md_col: md_final}).eq(id_col, row_id).execute()
                 except Exception as e:
                     LOGGER.warning("[db] Falha ao gravar MD na coluna %s: %s", args.db_md_col, e)
@@ -1404,9 +1497,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--pdf-url", required=False, help="URL para download do PDF")
     p.add_argument("--pdf-id", required=False, help="ID do PDF (pasta e nome base)")
     p.add_argument("--out-dir", default="out", help="Diretório de trabalho temporário")
-    p.add_argument("--bucket", default=os.getenv("SUPABASE_BUCKET", "articles"), help="Bucket do Supabase")
+    p.add_argument("--bucket", default=os.getenv("SUPABASE_BUCKET", "articles-pdfs"), help="Bucket do Supabase")
     p.add_argument("--emit-file", action="store_true", help="Também salva um arquivo .md em disco")
-    p.add_argument("--storage-prefix", default="articles/images", help="Prefixo de pasta dentro do bucket")
+    p.add_argument("--storage-prefix", default="articles/images", help="Prefixo de pasta dentro do bucket (somente se salvar em storage)")
     p.add_argument("--allowed-domains", default="supabase.co", help="Lista de domínios permitidos separados por vírgula")
     p.add_argument("--stdout", action="store_true", help="Imprime o Markdown final no stdout")
     p.add_argument("--log-level", default="WARNING", help="Nível de log (DEBUG, INFO, WARNING, ERROR)")
@@ -1464,13 +1557,26 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--db-offset", type=int, default=0, help="Offset inicial (padrão 0)")
     p.add_argument("--db-order-col", default="", help="(Opcional) Coluna para ordenar")
     p.add_argument("--db-order-dir", choices=["asc", "desc"], default="asc", help="Direção da ordenação")
-    p.add_argument("--db-md-to", choices=["storage", "column", "both", "none"], default="storage", help="Onde gravar o MD")
+    p.add_argument("--db-md-to", choices=["storage", "column", "both", "none"], default="column", help="Onde gravar o MD")
     p.add_argument("--db-md-storage-prefix", default="articles/md", help="Prefixo no bucket para salvar .md")
     p.add_argument("--db-md-col", default="", help="Coluna TEXT para gravar o Markdown (column/both)")
     p.add_argument("--db-md-url-col", default="", help="Coluna para gravar a URL pública do .md (storage/both)")
     p.add_argument("--db-success-col", default="", help="Coluna para marcar sucesso (timestamp ISO)")
     p.add_argument("--db-status-col", default="", help="Coluna para status textual (ok/fail)")
     p.add_argument("--db-error-col", default="", help="Coluna para mensagem de erro (vazio no sucesso)")
+    # --- imagens: template dinâmico de path ---
+    p.add_argument(
+        "--img-path-template",
+        default="{transmission_guide_id}/{id}",
+        help="Template do path interno no bucket para IMAGENS. Variáveis do row permitidas (ex.: {transmission_guide_id}, {id})."
+    )
+
+    # --- coluna opcional do transmission_guide_id (se o nome for diferente) ---
+    p.add_argument(
+        "--db-guide-id-col",
+        default="transmission_guide_id",
+        help="Nome da coluna na tabela que contém o transmission_guide_id."
+    )
     return p
 
 def main():
