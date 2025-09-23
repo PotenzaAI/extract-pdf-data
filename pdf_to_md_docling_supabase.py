@@ -1243,8 +1243,7 @@ def upload_images_to_supabase(
 # Pipeline principal (single PDF) e modo batch (DB)
 # =========================================================
 
-def pipeline_process_pdf(pdf_id: str, pdf_url: str, args, img_remote_subdir: str | None = None) -> tuple[str, Path]:
-
+def pipeline_process_pdf(pdf_id: str, pdf_url: str, args, img_remote_subdir: str | None = None) -> tuple[str, Path, str]:
     allowed_domains = [d.strip() for d in (args.allowed_domains or "").split(",") if d.strip()]
     pdf_id = slug_filename(str(pdf_id))
 
@@ -1287,93 +1286,141 @@ def pipeline_process_pdf(pdf_id: str, pdf_url: str, args, img_remote_subdir: str
         include_page_images=bool(args.include_page_images),
     )
 
+    # Se Docling veio curto e fallback foi solicitado, tenta pymupdf4llm
     if args.fallback_extractor == "pymupdf4llm" and (not md_raw or len(md_raw) < args.fallback_min_chars):
         LOGGER.info("[2b] Fallback: pymupdf4llm (Docling curto/ruim)…")
         md_fb = convert_fallback_pymupdf4llm(local_pdf)
         if md_fb and len(md_fb) > len(md_raw):
             md_raw = md_fb
 
-    LOGGER.info("[3/6] Higienizando Markdown (whitelist de domínios)…")
-    md_clean = sanitize_markdown(md_raw, allowed_domains=allowed_domains)
+    # ----------------------------------------------------------------
+    # A PARTIR DAQUI, SEMPRE USE MD_CURR E NUNCA DEPENDA DE VARIÁVEL
+    # QUE POSSA NÃO SER DEFINIDA SE UMA ETAPA DER ERRO.
+    # ----------------------------------------------------------------
+    md_curr = md_raw
 
-    LOGGER.info("[3b] Refino do Markdown (headings/linhas/imagens/DTCs)…")
-    md_polished = polish_markdown(md_clean)
-    md_polished = polish_markdown_fidelity_plus(md_polished)
+    # 3/6 Sanitização
+    try:
+        LOGGER.info("[3/6] Higienizando Markdown (whitelist de domínios)…")
+        md_curr = sanitize_markdown(md_curr, allowed_domains=allowed_domains)
+    except Exception as e:
+        LOGGER.warning("[sanitize] Falhou (%s). Mantendo conteúdo anterior.", e)
 
-    brand_terms = [x.strip() for x in (args.drop_brand_terms or "").split(",") if x.strip()]
-    md_polished = drop_corporate_branding(md_polished, brand_terms=brand_terms, max_len=args.drop_brand_max_len)
+    # 3b/6 Polimento
+    try:
+        LOGGER.info("[3b] Refino do Markdown (headings/linhas/imagens/DTCs)…")
+        md_curr = polish_markdown(md_curr)
+        md_curr = polish_markdown_fidelity_plus(md_curr)
+    except Exception as e:
+        LOGGER.warning("[polish] Falhou (%s). Mantendo conteúdo anterior.", e)
 
+    # Branding
+    try:
+        brand_terms = [x.strip() for x in (args.drop_brand_terms or "").split(",") if x.strip()]
+        md_curr = drop_corporate_branding(md_curr, brand_terms=brand_terms, max_len=args.drop_brand_max_len)
+    except Exception as e:
+        LOGGER.warning("[branding] Falhou (%s). Mantendo conteúdo anterior.", e)
+
+    # Fidelity extra
     if args.fidelity_max:
-        LOGGER.info("[3b+] Polimento fidelity++ (listas/tabelas/linhas curtas repetidas)…")
-        md_polished = polish_markdown_fidelity(
-            md_polished,
-            drop_repeated_lines=True,
-            repeated_min_count=args.drop_repeated_lines_min_count,
-            repeated_max_len=args.drop_repeated_lines_max_len,
-        )
+        try:
+            LOGGER.info("[3b+] Polimento fidelity++ (listas/tabelas/linhas curtas repetidas)…")
+            md_curr = polish_markdown_fidelity(
+                md_curr,
+                drop_repeated_lines=True,
+                repeated_min_count=args.drop_repeated_lines_min_count,
+                repeated_max_len=args.drop_repeated_lines_max_len,
+            )
+        except Exception as e:
+            LOGGER.warning("[fidelity] Falhou (%s). Mantendo conteúdo anterior.", e)
 
-    LOGGER.info("[3c] Removendo imagens específicas (template/nome/área)…")
-    md_filtered, removed_paths = remove_specific_images_from_md(
-        md_polished,
-        base_dir=md_path.parent,
-        template_paths=args.drop_image_template,
-        hash_threshold=args.drop_image_hash_threshold,
-        name_regex=(args.drop_image_name_re or None),
-        max_area=(args.drop_image_max_area if args.drop_image_max_area > 0 else None),
-        tpl_phash_threshold=args.drop_image_tpl_phash_threshold,
-        aspect_tol=args.drop_image_aspect_tol,
-        color_check=bool(args.drop_image_color_check),
-        debug=args.drop_image_debug,
-    )
-    if removed_paths:
-        LOGGER.info(" - %s imagem(ns) removida(s).", len(removed_paths))
-    md_polished = md_filtered
-
-    if args.drop_repeated:
-        LOGGER.info("[3d] Removendo imagens repetidas por conteúdo…")
-        area_min = args.drop_repeated_area_min if args.drop_repeated_area_min > 0 else None
-        area_max = args.drop_repeated_area_max if args.drop_repeated_area_max > 0 else None
-        md_dedup, rep_report = drop_repeated_images_in_md(
-            md_polished,
+    # 3c/6 Remoção de imagens específicas
+    try:
+        LOGGER.info("[3c] Removendo imagens específicas (template/nome/área)…")
+        md_filtered, removed_paths = remove_specific_images_from_md(
+            md_curr,
             base_dir=md_path.parent,
-            hash_threshold=args.drop_repeated_hash_threshold,
-            min_count=args.drop_repeated_min_count,
-            size_tol=args.drop_repeated_size_tol,
-            keep=args.drop_repeated_keep,
-            area_min=area_min,
-            area_max=area_max,
-            debug=args.drop_repeated_debug,
+            template_paths=args.drop_image_template,
+            hash_threshold=args.drop_image_hash_threshold,
+            name_regex=(args.drop_image_name_re or None),
+            max_area=(args.drop_image_max_area if args.drop_image_max_area > 0 else None),
+            tpl_phash_threshold=args.drop_image_tpl_phash_threshold,
+            aspect_tol=args.drop_image_aspect_tol,
+            color_check=bool(args.drop_image_color_check),
+            debug=args.drop_image_debug,
         )
-        if rep_report:
-            total = sum(v["count"] for v in rep_report.values())
-            LOGGER.info(" - clusters repetidos: %s (ocorrências totais=%s)", len(rep_report), total)
-        md_polished = md_dedup
+        if removed_paths:
+            LOGGER.info(" - %s imagem(ns) removida(s).", len(removed_paths))
+        md_curr = md_filtered
+    except Exception as e:
+        LOGGER.warning("[drop-specific] Falhou (%s). Mantendo conteúdo anterior.", e)
 
+    # 3d/6 Deduplicação de imagens
+    if args.drop_repeated:
+        try:
+            LOGGER.info("[3d] Removendo imagens repetidas por conteúdo…")
+            area_min = args.drop_repeated_area_min if args.drop_repeated_area_min > 0 else None
+            area_max = args.drop_repeated_area_max if args.drop_repeated_area_max > 0 else None
+            md_dedup, rep_report = drop_repeated_images_in_md(
+                md_curr,
+                base_dir=md_path.parent,
+                hash_threshold=args.drop_repeated_hash_threshold,
+                min_count=args.drop_repeated_min_count,
+                size_tol=args.drop_repeated_size_tol,
+                keep=args.drop_repeated_keep,
+                area_min=area_min,
+                area_max=area_max,
+                debug=args.drop_repeated_debug,
+            )
+            if rep_report:
+                total = sum(v["count"] for v in rep_report.values())
+                LOGGER.info(" - clusters repetidos: %s (ocorrências totais=%s)", len(rep_report), total)
+            md_curr = md_dedup
+        except Exception as e:
+            LOGGER.warning("[drop-repeated] Falhou (%s). Mantendo conteúdo anterior.", e)
+
+    # 4/6 Coleta de imagens (usa SEMPRE md_curr — que está definido)
     LOGGER.info("[4/6] Coletando imagens locais referenciadas no MD…")
-    local_images = collect_local_images_from_md(md_polished, base_dir=md_path.parent)
+    local_images = collect_local_images_from_md(md_curr, base_dir=md_path.parent)
 
+    # 5/6 Upload das imagens
     LOGGER.info("[5/6] Enviando imagens ao Supabase… (bucket=%s, pasta=%s/%s/)",
                 args.bucket, args.storage_prefix, pdf_id)
     client = supabase_client_from_env()
-    url_map = upload_images_to_supabase(
-        client,
-        args.bucket,
-        pdf_id,
-        local_images,
-        storage_prefix=args.storage_prefix,
-        remote_subdir=img_remote_subdir,   # <= repassa aqui
-    )
+    url_map: Dict[Path, str] = {}
+    if local_images:
+        try:
+            url_map = upload_images_to_supabase(
+                client,
+                args.bucket,
+                pdf_id,
+                local_images,
+                storage_prefix=args.storage_prefix,
+                remote_subdir=img_remote_subdir,
+            )
+        except Exception as e:
+            LOGGER.warning("[upload-images] Falhou (%s). Continuando sem reescrever URLs.", e)
 
+    # Captura a PRIMEIRA imagem enviada (se houve)
+    first_image_url = ""
+    if local_images and url_map:
+        first_image_url = url_map.get(local_images[0]) or ""
 
+    # 6/6 Reescrita das referências (se houver mapa)
     LOGGER.info("[6/6] Reescrevendo referências de imagem no Markdown…")
-    md_final = rewrite_image_paths_in_md(md_polished, base_dir=md_path.parent, url_map=url_map)
+    md_final = md_curr
+    try:
+        if url_map:
+            md_final = rewrite_image_paths_in_md(md_curr, base_dir=md_path.parent, url_map=url_map)
+    except Exception as e:
+        LOGGER.warning("[rewrite-img-paths] Falhou (%s). Mantendo caminhos locais.", e)
 
     if args.emit_file:
         md_out = work_dir / f"{pdf_id}.md"
         md_out.write_text(md_final, encoding="utf-8")
         LOGGER.info("Markdown salvo em: %s", md_out)
 
-    return md_final, work_dir
+    return md_final, work_dir, first_image_url
 
 def run_db_batch(args) -> None:
     client = supabase_client_from_env()
@@ -1432,7 +1479,7 @@ def run_db_batch(args) -> None:
 
         try:
             # passa a subpasta montada para o pipeline (ele repassa para o uploader)
-            md_final, _work_dir = pipeline_process_pdf(
+            md_final, _work_dir, first_image_url = pipeline_process_pdf(
                 str(row_id),
                 str(pdf_url),
                 args,
@@ -1466,6 +1513,10 @@ def run_db_batch(args) -> None:
                 updates[args.db_error_col] = ""
             if args.db_md_url_col and md_url:
                 updates[args.db_md_url_col] = md_url
+
+            # +++ ADICIONE:
+            if getattr(args, "db_preview_col", None) and first_image_url:
+                updates[args.db_preview_col] = first_image_url
 
             if updates:
                 client.table(table).update(updates).eq(id_col, row_id).execute()
@@ -1564,6 +1615,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--db-success-col", default="", help="Coluna para marcar sucesso (timestamp ISO)")
     p.add_argument("--db-status-col", default="", help="Coluna para status textual (ok/fail)")
     p.add_argument("--db-error-col", default="", help="Coluna para mensagem de erro (vazio no sucesso)")
+    p.add_argument("--db-preview-col",default="image_preview",help="Coluna que receberá a URL da primeira imagem enviada ao bucket.")
     # --- imagens: template dinâmico de path ---
     p.add_argument(
         "--img-path-template",
@@ -1592,7 +1644,7 @@ def main():
     if not args.pdf_url or not args.pdf_id:
         raise RuntimeError("Uso single-run: informe --pdf-url e --pdf-id, ou use --db-table para modo batch.")
 
-    md_final, _work_dir = pipeline_process_pdf(args.pdf_id, args.pdf_url, args)
+    md_final, _work_dir, _first_image_url = pipeline_process_pdf(args.pdf_id, args.pdf_url, args)
 
     if args.stdout:
         print(md_final)
