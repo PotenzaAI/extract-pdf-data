@@ -20,7 +20,7 @@ Cria um arquivo em markdown com o conteúdo da extração chamado `_docling.md`.
 ### Upload para Supabase Storage
 
 * Envia as **imagens** para o **bucket** configurado.
-* Reescreve o **Markdown** substituindo os caminhos locais pelas **URLs públicas** do Supabase em um novo arquivo markdown nomeado de acordo com o id `id.pdf` .
+* Reescreve o **Markdown** substituindo os caminhos locais pelas **URLs públicas** do Supabase em um novo arquivo markdown nomeado de acordo com o id `id.pdf` ou o markdown é salvo na tabela na coluna `manual_content`  .
 
 ### Persistência
 
@@ -82,11 +82,13 @@ Processa registros lendo **ID** e **URL do PDF** de uma tabela no Supabase e env
 # PowerShell (Windows)
 python .\pdf_to_md_docling_supabase.py `
   --db-table transmission_manuals `          # Nome da tabela
-  --db-id-col transmission_guide_id `                           # Nome da coluna com o ID
-  --db-url-col pdf_url `                     # Nome da coluna com a URL do PDF
-  --db-md-to storage `                       # Envia o Markdown ao bucket
+  --db-id-col transmission_guide_id `        # Nome da coluna com o ID do guia
+  --db-url-col original_file_link `          # Nome da coluna com a URL do PDF
+  --db-id-col id `                           # Nome da coluna com o ID do PDF do guia
+  --db-md-col manual_content `               # Nome da coluna que irá salvar os markdown
+  --db-md-to storage `                       # Envia o Markdown ao bucket (opcional, já que salva na tabela)
   --storage-prefix "articles/images" `       # Caminho no bucket para IMAGENS
-  --db-md-storage-prefix "articles/md" `     # Caminho no bucket para MARKDOWN
+  --db-md-storage-prefix "articles/md" `     # Caminho no bucket para MARKDOWN (opcional)
   --bucket articles-pdfs `                   # Nome do bucket
   --wm-clean `                               # Remove marcas d'água
   --drop-repeated `                          # Remove imagens repetidas (cab/rodapé)
@@ -99,7 +101,9 @@ python .\pdf_to_md_docling_supabase.py `
 python ./pdf_to_md_docling_supabase.py \
   --db-table transmission_manuals \
   --db-id-col transmission_guide_id \
-  --db-url-col pdf_url \
+  --db-url-col original_file_link \
+  --db-id-col id \                          
+  --db-md-col manual_content \  
   --db-md-to storage \
   --storage-prefix "articles/images" \
   --db-md-storage-prefix "articles/md" \
