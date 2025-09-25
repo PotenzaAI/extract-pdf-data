@@ -23,7 +23,7 @@ from PIL import Image
 from dotenv import load_dotenv
 from supabase import create_client
 from urllib.parse import urlparse
-
+from datetime import datetime, timezone
 import cv2  # OpenCV
 from docling.document_converter import DocumentConverter, PdfFormatOption
 from docling.datamodel.base_models import InputFormat
@@ -55,6 +55,7 @@ def setup_logging(level: str = "WARNING") -> None:
 # =========================================================
 # Utils
 # =========================================================
+from datetime import datetime, timezone
 
 def ensure_dir(p: Path) -> None:
     p.mkdir(parents=True, exist_ok=True)
@@ -1423,6 +1424,40 @@ def pipeline_process_pdf(pdf_id: str, pdf_url: str, args, img_remote_subdir: str
     return md_final, work_dir, first_image_url
 
 def run_db_batch(args) -> None:
+    # helper local para parse de datas
+    def _parse_dt_any(s: str) -> datetime:
+        """
+        Aceita:
+        - ISO com '-' ou '/' na parte da data: YYYY-MM-DDTHH:MM:SS[.fff][Z|±HH:MM]
+        - BR: DD/MM/YYYY [HH:MM[:SS]]
+        - Também aceita DD-MM-YYYY convertendo para DD/MM/YYYY
+        Sempre retorna UTC (tzinfo=UTC).
+        """
+        import re
+        s = (s or "").strip()
+        if not s:
+            raise ValueError("data vazia")
+
+        # ISO-like com 'T' no meio (normaliza YYYY/MM/DD -> YYYY-MM-DD)
+        if "T" in s:
+            s2 = s.replace("Z", "+00:00")
+            m = re.match(r"^(\d{4})[/-](\d{2})[/-](\d{2})(T.*)$", s2)
+            if m:
+                s2 = f"{m.group(1)}-{m.group(2)}-{m.group(3)}{m.group(4)}"
+            dt = datetime.fromisoformat(s2)
+            return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+        # BR: DD/MM/YYYY [HH:MM[:SS]]  (aceita com '-' também)
+        s_br = s.replace("-", "/")
+        for fmt in ("%d/%m/%Y", "%d/%m/%Y %H:%M", "%d/%m/%Y %H:%M:%S"):
+            try:
+                dt = datetime.strptime(s_br, fmt)
+                return dt.replace(tzinfo=timezone.utc)
+            except ValueError:
+                continue
+
+        raise ValueError(f"formato de data não suportado: {s!r}")
+
     client = supabase_client_from_env()
     table = args.db_table.strip()
     id_col = args.db_id_col.strip()
@@ -1452,6 +1487,17 @@ def run_db_batch(args) -> None:
 
     LOGGER.info("[db] %s linha(s) para processar.", len(rows))
 
+    # limiar de data opcional
+    threshold_s = (getattr(args, "db_min_populated_at", "") or "").strip()
+    threshold_dt = None
+    if threshold_s:
+        try:
+            threshold_dt = _parse_dt_any(threshold_s)
+            LOGGER.info("[db] Aplicando corte por populated_at >= %s", threshold_dt.isoformat())
+        except Exception as e:
+            LOGGER.warning("[db] Valor inválido em --db-min-populated-at: %r (%s). Ignorando corte.", threshold_s, e)
+            threshold_dt = None
+
     for idx, row in enumerate(rows, 1):
         try:
             row_id = row[id_col]
@@ -1460,25 +1506,37 @@ def run_db_batch(args) -> None:
             LOGGER.warning("[db] Linha sem colunas %s/%s. Pulando.", id_col, url_col)
             continue
 
-        # --- NOVO: obtenha o transmission_guide_id (nome da coluna configurável) ---
+        # SKIP por populated_at (anterior ao limiar)
+        if threshold_dt is not None:
+            try:
+                raw_pop = row.get("populated_at")
+                if raw_pop:
+                    row_dt = _parse_dt_any(str(raw_pop))
+                    if row_dt < threshold_dt:
+                        LOGGER.info(
+                            "[db] (%s/%s) id=%s SKIP (populated_at=%s < %s)",
+                            idx, len(rows), row_id, row_dt.isoformat(), threshold_dt.isoformat()
+                        )
+                        continue
+                # sem populated_at → processa
+            except Exception as e:
+                LOGGER.warning("[db] Falha ao avaliar populated_at em id=%s: %s. Prosseguindo.", row_id, e)
+
+        # transmission_guide_id e subpasta
         tg_col = args.db_guide_id_col
         transmission_guide_id = row.get(tg_col)
         if transmission_guide_id is None:
             LOGGER.warning("[db] id=%s sem %s. Usando 'unknown'.", row_id, tg_col)
             transmission_guide_id = "unknown"
 
-        # --- NOVO: monte a subpasta final a partir do template ---
         try:
-            # Ex.: "articles/images/{transmission_guide_id}/{id}" -> "articles/images/123/456"
             subdir = args.img_path_template.format(**row)
         except Exception:
-            # fallback seguro se faltar alguma chave
             subdir = f"articles/images/{transmission_guide_id}/{row_id}"
 
         LOGGER.info("[db] (%s/%s) id=%s url=%s -> img_subdir=%s", idx, len(rows), row_id, pdf_url, subdir)
 
         try:
-            # passa a subpasta montada para o pipeline (ele repassa para o uploader)
             md_final, _work_dir, first_image_url = pipeline_process_pdf(
                 str(row_id),
                 str(pdf_url),
@@ -1486,7 +1544,6 @@ def run_db_batch(args) -> None:
                 img_remote_subdir=subdir
             )
 
-            # --- GRAVAÇÃO DO MARKDOWN NA COLUNA ---
             md_url = ""
             if args.db_md_to in ("storage", "both"):
                 remote_path = f"{args.db_md_storage_prefix.strip().strip('/')}/{slug_filename(str(row_id))}.md"
@@ -1499,7 +1556,6 @@ def run_db_batch(args) -> None:
 
             if args.db_md_to in ("column", "both") and args.db_md_col:
                 try:
-                    # IMPORTANTE: garanta que o filtro .eq() bate o tipo da coluna de ID
                     client.table(table).update({args.db_md_col: md_final}).eq(id_col, row_id).execute()
                 except Exception as e:
                     LOGGER.warning("[db] Falha ao gravar MD na coluna %s: %s", args.db_md_col, e)
@@ -1513,8 +1569,6 @@ def run_db_batch(args) -> None:
                 updates[args.db_error_col] = ""
             if args.db_md_url_col and md_url:
                 updates[args.db_md_url_col] = md_url
-
-            # +++ ADICIONE:
             if getattr(args, "db_preview_col", None) and first_image_url:
                 updates[args.db_preview_col] = first_image_url
 
@@ -1530,8 +1584,7 @@ def run_db_batch(args) -> None:
             if args.db_status_col:
                 updates[args.db_status_col] = "fail"
             if args.db_error_col:
-                msg = str(e)
-                updates[args.db_error_col] = msg[:2000]
+                updates[args.db_error_col] = str(e)[:2000]
             if updates:
                 try:
                     client.table(table).update(updates).eq(id_col, row_id).execute()
@@ -1629,6 +1682,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default="transmission_guide_id",
         help="Nome da coluna na tabela que contém o transmission_guide_id."
     )
+    p.add_argument(
+    "--db-min-populated-at",
+    default="",
+    help="Somente processa linhas com populated_at >= esta data (YYYY-MM-DD ou ISO)."
+    )
+
     return p
 
 def main():
