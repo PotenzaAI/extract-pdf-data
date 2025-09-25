@@ -93,6 +93,7 @@ python .\pdf_to_md_docling_supabase.py `
   --wm-clean `                               # Remove marcas d'água
   --drop-repeated `                          # Remove imagens repetidas (cab/rodapé)
   --drop-image-template "logo.png" `         # Template da logo (CAB) para remoção
+  --db-min-populated-at 25/09/2025 `         # Data limite para o arquivo ser processado
   --emit-file --force-bom                    # Também gera o arquivo .md local e padrão utf-8
 ```
 
