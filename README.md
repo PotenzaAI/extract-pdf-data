@@ -95,6 +95,8 @@ python .\pdf_to_md_docling_supabase.py `
   --drop-image-template "logo.png" `         # Template da logo (CAB) para remoção
   --db-min-populated-at 25/09/2025 `         # Data limite para o arquivo ser processado
   --emit-file --force-bom                    # Também gera o arquivo .md local e padrão utf-8
+  --convert-timeout 300 `                    # ignora PDFs que demoram demais ao converter, que provavlmente tem algum problema
+  --log-level INFO
 ```
 
 ```bash
@@ -112,7 +114,9 @@ python ./pdf_to_md_docling_supabase.py \
   --wm-clean \
   --drop-repeated \
   --drop-image-template "logo.png" \
-  --emit-file --force-bom                   
+  --emit-file --force-bom \
+  --convert-timeout 300 \
+  --log-level INFO            
 ```
 
 ### Modo URL única
