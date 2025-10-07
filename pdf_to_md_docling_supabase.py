@@ -29,6 +29,14 @@ from docling.document_converter import DocumentConverter, PdfFormatOption
 from docling.datamodel.base_models import InputFormat
 from docling.datamodel.pipeline_options import PdfPipelineOptions
 
+# topo do arquivo
+import multiprocessing as mp
+import io
+try:
+    import pikepdf  # validação estrutural do PDF
+except Exception:
+    pikepdf = None
+
 # Fallback extractor
 try:
     import pymupdf4llm  # pip install pymupdf4llm
@@ -43,6 +51,59 @@ except Exception:
 
 LOGGER = logging.getLogger("pdf_to_md")
 
+def _bhattacharyya(h1: np.ndarray, h2: np.ndarray) -> float:
+    h1 = h1.reshape(-1).astype("float32")
+    h2 = h2.reshape(-1).astype("float32")
+    h1 = np.clip(h1, 0, 1); h2 = np.clip(h2, 0, 1)
+    s = float(np.sum(np.sqrt(np.clip(h1 * h2, 0.0, 1.0))))
+    return float(np.sqrt(max(0.0, 1.0 - s)))
+
+def _scan_do_names_from_contents(contents: bytes) -> set[str]:
+    # procura padrões "/Name Do"
+    names = set()
+    for m in re.finditer(rb"/([A-Za-z0-9\._]+)\s+Do\b", contents or b""):
+        try:
+            names.add(m.group(1).decode("latin1"))
+        except Exception:
+            pass
+    return names
+
+def validate_pdf_integrity(pdf_path: Path) -> tuple[bool, str]:
+    if not pdf_path.exists():
+        return False, "arquivo inexistente"
+    if pikepdf is None:
+        # sem pikepdf: não bloqueia; apenas permite
+        return True, "skip-validate"
+    try:
+        with pikepdf.open(str(pdf_path)) as pdf:
+            # 1) OCProperties/D quando existir OCProperties
+            ocp = pdf.root.get("/OCProperties", None)
+            if ocp is not None and "/D" not in ocp:
+                return False, "OCProperties sem /D"
+
+            # 2) XObject coerente com 'Do'
+            for page in pdf.pages:
+                resources = page.get("/Resources", pikepdf.Dictionary())
+                xo = resources.get("/XObject", pikepdf.Dictionary())
+                xobj_names = {k[1:] if k.startswith("/") else k for k in xo.keys()}
+                # ler todos os streams de conteúdo
+                contents = page.get("/Contents", None)
+                buf = b""
+                if isinstance(contents, pikepdf.Stream):
+                    buf = bytes(contents.read_bytes())
+                elif isinstance(contents, pikepdf.Array):
+                    for s in contents:
+                        if isinstance(s, pikepdf.Stream):
+                            buf += bytes(s.read_bytes()) + b"\n"
+                # procura Do
+                do_names = _scan_do_names_from_contents(buf)
+                if do_names and not xobj_names.issuperset(do_names):
+                    return False, f"Do sem XObject: {sorted(do_names - xobj_names)[:5]}"
+        return True, "ok"
+    except Exception as e:
+        return False, f"pikepdf open falhou: {e}"
+
+
 def setup_logging(level: str = "WARNING") -> None:
     lvl = getattr(logging, level.upper(), logging.WARNING)
     logging.basicConfig(
@@ -51,6 +112,29 @@ def setup_logging(level: str = "WARNING") -> None:
         handlers=[logging.StreamHandler(sys.stderr)],
     )
     LOGGER.setLevel(lvl)
+
+def _docling_worker(pdf_path_str: str, out_dir_str: str, include_page_images: bool, q: mp.Queue):
+    try:
+        pdf_path = Path(pdf_path_str); out_dir = Path(out_dir_str)
+        md_text, md_tmp = convert_with_docling(pdf_path, out_dir, images_scale=2.0, include_page_images=include_page_images)
+        q.put(("ok", md_text, str(md_tmp)))
+    except Exception as e:
+        q.put(("err", str(e), ""))
+
+def convert_with_docling_timeout(pdf_path: Path, out_dir: Path, include_page_images: bool, timeout_sec: int) -> Tuple[str, Path]:
+    q: mp.Queue = mp.Queue()
+    p = mp.Process(target=_docling_worker, args=(str(pdf_path), str(out_dir), include_page_images, q), daemon=True)
+    p.start()
+    p.join(timeout=timeout_sec)
+    if p.is_alive():
+        p.terminate(); p.join(5)
+        raise TimeoutError(f"Docling timeout ({timeout_sec}s)")
+    if q.empty():
+        raise RuntimeError("Docling não retornou resultado")
+    status, a, b = q.get()
+    if status == "ok":
+        return a, Path(b)
+    raise RuntimeError(a)
 
 # =========================================================
 # Utils
@@ -558,7 +642,7 @@ def run_watermark_cleaner(
             if mask_debug:
                 cmd += ["--mask-debug", str(mask_debug)]
             LOGGER.info("[wm] Executando: %s", " ".join(cmd))
-            r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=False)
             if r.stdout:
                 LOGGER.debug("[wm] stdout: %s", r.stdout[:1000])
             if r.stderr:
@@ -1258,8 +1342,9 @@ def pipeline_process_pdf(pdf_id: str, pdf_url: str, args, img_remote_subdir: str
     LOGGER.info("[1/6] Baixando PDF… %s", pdf_url)
     download_pdf(pdf_url, local_pdf)
 
+    cleaned_pdf = None
     if args.wm_clean:
-        LOGGER.info("[2a] Limpando marcas d’água (pikepdf/pdfcpu/inpaint)…")
+        LOGGER.info("[2a] Limpando marcas d’água…")
         cleaned_pdf = work_dir / f"{pdf_id}.wmclean.pdf"
         mask_dir = Path(args.wm_mask_debug).resolve() if args.wm_mask_debug else None
         ok = run_watermark_cleaner(
@@ -1274,17 +1359,21 @@ def pipeline_process_pdf(pdf_id: str, pdf_url: str, args, img_remote_subdir: str
             mask_debug=mask_dir,
         )
         if ok:
-            local_pdf = cleaned_pdf
-            LOGGER.info(" - PDF limpo será usado na conversão.")
+            valid, reason = validate_pdf_integrity(cleaned_pdf)
+            if valid:
+                local_pdf = cleaned_pdf
+                LOGGER.info(" - PDF limpo válido. Usando-o.")
+            else:
+                LOGGER.warning(" - PDF limpo inválido (%s). Usando original.", reason)
         else:
-            LOGGER.warning(" - Limpeza falhou/sem saída. Usando PDF original.")
+            LOGGER.warning(" - Limpeza sem saída. Usando original.")
 
-    LOGGER.info("[2/6] Convertendo com Docling (Markdown + imagens)…")
-    md_raw, md_path = convert_with_docling(
+    LOGGER.info("[2/6] Convertendo com Docling (timeout=%ss)…", args.convert_timeout)
+    md_raw, md_path = convert_with_docling_timeout(
         local_pdf,
         work_dir,
-        images_scale=2.0,
         include_page_images=bool(args.include_page_images),
+        timeout_sec=int(args.convert_timeout),
     )
 
     # Se Docling veio curto e fallback foi solicitado, tenta pymupdf4llm
@@ -1469,7 +1558,11 @@ def run_db_batch(args) -> None:
     q = client.table(table).select("*")
 
     if args.db_where_col and args.db_where_val:
-        q = q.eq(args.db_where_col, args.db_where_val)
+        if args.db_where_val.lower() in {"null", "is.null", "is.null."}:
+            q = q.is_(args.db_where_col, "null")
+        else:
+            q = q.eq(args.db_where_col, args.db_where_val)
+
 
     if args.db_order_col:
         q = q.order(args.db_order_col, desc=(args.db_order_dir == "desc"))
@@ -1581,6 +1674,9 @@ def run_db_batch(args) -> None:
         except Exception as e:
             LOGGER.error("[db] ERRO no id=%s: %s", row_id, e)
             updates = {}
+            # grava ERROR: no manual_content (ou coluna definida)
+            if args.db_md_col:
+                updates[args.db_md_col] = "ERROR:"
             if args.db_status_col:
                 updates[args.db_status_col] = "fail"
             if args.db_error_col:
@@ -1590,6 +1686,7 @@ def run_db_batch(args) -> None:
                     client.table(table).update(updates).eq(id_col, row_id).execute()
                 except Exception as e2:
                     LOGGER.warning("[db] Falha ao atualizar status de erro: %s", e2)
+
 
 # =========================================================
 # CLI
@@ -1687,6 +1784,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     default="",
     help="Somente processa linhas com populated_at >= esta data (YYYY-MM-DD ou ISO)."
     )
+
+    p.add_argument("--convert-timeout", type=int, default=300, help="Timeout (s) da conversão Docling por PDF")
+
 
     return p
 
